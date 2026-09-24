@@ -1,2 +1,7 @@
-speechrecognition>=3.10.0
-pyaudio>=0.2.11
+# Requires Python 3.10, 3.11 or 3.12 (64-bit).
+# PyAudio 0.2.14 has NO prebuilt wheel for Python 3.13+/3.14 yet, so pip
+# tries to compile it from source and fails with
+# "Microsoft Visual C++ 14.0 or greater is required".
+# Use Python 3.11 for the smoothest install (stdlib audioop still present).
+SpeechRecognition==3.10.4
+PyAudio==0.2.14
