@@ -909,7 +909,27 @@ def already_running():
     return kernel32.GetLastError() == 183          # ERROR_ALREADY_EXISTS
 
 
+def enable_crisp_rendering():
+    """Opt out of Windows' DPI virtualization.
+
+    Without this, on any display scaling above 100% Windows renders the
+    panel at 96 dpi and stretches the bitmap, which looks pixelated.
+    Must run before tk.Tk() is created.
+    """
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor V2
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()  # pre-8.1
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
+    enable_crisp_rendering()
     if already_running():
         raise SystemExit(0)
     root = tk.Tk()
