@@ -243,6 +243,7 @@ class Recorder:
         self.lock = threading.Lock()
         self.ui = queue.Queue()
         self.body_font = None
+        self.foot_font = None
         self.trying = ""
 
         self.canvas = tk.Canvas(root, width=W, height=self.height(),
@@ -343,6 +344,15 @@ class Recorder:
 
         label = self.note or self.short_name()
         if label:
+            # Long device names would run into the footer buttons, so
+            # truncate to whatever space is left and add an ellipsis.
+            if self.foot_font is None:
+                self.foot_font = tkfont.Font(family=FONT, size=8)
+            full, max_w = label, W - PAD - x - 8
+            while label and self.foot_font.measure(label + "\u2026") > max_w:
+                label = label[:-1]
+            if label != full:
+                label = label.rstrip() + "\u2026"
             c.create_text(W - PAD, h - H_FOOT / 2, anchor="e", text=label,
                           fill=FAINT, font=(FONT, 8))
 
