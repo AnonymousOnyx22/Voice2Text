@@ -22,6 +22,9 @@ MAX_SPEECH = 900      # highest: talking during calibration must not blind us
 PROBE = 0.2           # seconds spent ranking each endpoint
 BODY_LINES = 3        # transcript lines shown; the panel never grows
 BAD_DEVICE = "This mic is not delivering audio properly. Pick another below."
+MIC_BLOCKED = ("Couldn't open this microphone (error -9999). Check Settings "
+               "> Privacy & security > Microphone, close apps holding the mic, "
+               "or press tab to pick a different one.")
 
 # --- panel geometry -----------------------------------------------------
 W = 620
@@ -638,7 +641,7 @@ class Recorder:
             self.post(self.set_trying,
                       "" if last else f"{position + 1}/{len(endpoints)}")
             if self.capture(index, rate, allow_switch=not last):
-                self.remember_endpoint(index, rate)
+                self.remember_endpoint(index, self.rate)
                 break
             if not self.listening:
                 break
@@ -666,9 +669,10 @@ class Recorder:
         alts = list(dev.get("alts") or [(dev["index"], dev["rate"])])
         ranked = []
         for index, rate in alts:
-            level = self.probe(index, rate)
-            if level is None:
+            probed = self.probe(index, rate)
+            if probed is None:
                 continue                       # will not open, or floods
+            level, rate = probed
             ranked.append((level, index, rate))
         if not ranked:
             return alts                        # nothing probed cleanly; try all
@@ -676,6 +680,19 @@ class Recorder:
         return [(index, rate) for _, index, rate in ranked]
 
     def probe(self, index, rate):
+        """Peak level and working rate, or None if the endpoint is broken.
+
+        Intel SST and other built-in mics sometimes refuse their own
+        reported rate with OSError -9999, so sibling rates are tried too;
+        the rate that worked is reported back for capture to use.
+        """
+        for attempt in dict.fromkeys([rate, 48000, 44100, 16000]):
+            peak = self.try_probe(index, attempt)
+            if peak is not None:
+                return peak, attempt
+        return None
+
+    def try_probe(self, index, rate):
         """Peak level over a short sample, or None if the endpoint is broken."""
         import pyaudio
         pa = pyaudio.PyAudio()
@@ -716,6 +733,27 @@ class Recorder:
         self.note = "trying next endpoint"
         self.refresh()
 
+    @staticmethod
+    def open_stream(pa, pyaudio, index, rate):
+        """Open the endpoint, retrying common sample rates.
+
+        Some drivers report a default rate they then refuse with OSError
+        -9999; a sibling rate usually opens fine. Returns the stream and
+        the rate that worked. Non--9999 errors are raised immediately.
+        """
+        last = None
+        for attempt in dict.fromkeys([rate, 48000, 44100, 16000]):
+            try:
+                return pa.open(format=pyaudio.paInt16, channels=1,
+                               rate=attempt, input=True,
+                               input_device_index=index,
+                               frames_per_buffer=1024), attempt
+            except OSError as e:
+                last = e
+                if "-9999" not in str(e):
+                    raise
+        raise last
+
     def capture(self, index, rate, allow_switch):
         """Stream one endpoint. False means it never heard anything."""
         import pyaudio
@@ -723,9 +761,8 @@ class Recorder:
         stream = None
         heard = False
         try:
-            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=rate,
-                             input=True, input_device_index=index,
-                             frames_per_buffer=1024)
+            stream, rate = self.open_stream(pa, pyaudio, index, rate)
+            self.rate = rate
             chunk = 1024 / rate
             floor = self.measure_floor(stream, rate)
             speech = min(MAX_SPEECH, max(MIN_SPEECH, floor * 3))
@@ -776,7 +813,10 @@ class Recorder:
         except Exception as e:
             if allow_switch:
                 return False
-            self.post(self.fail, f"{type(e).__name__}: {e}")
+            if isinstance(e, OSError) and "-9999" in str(e):
+                self.post(self.fail, MIC_BLOCKED)
+            else:
+                self.post(self.fail, f"{type(e).__name__}: {e}")
             return True
         finally:
             if stream is not None:
