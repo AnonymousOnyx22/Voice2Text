@@ -465,8 +465,33 @@ class Recorder:
 
     def _load(self):
         devices = input_devices()
+        devices = self.filter_working(devices)
         self.post(self._loaded, devices)
         self.root.after(0, self.tick)
+
+    def filter_working(self, devices):
+        """Keep only microphones that actually open.
+
+        Runs once at startup on the loader thread: endpoints that refuse
+        every sample rate or flood are dropped, and devices left with
+        nothing usable are hidden, so the picker lists only mics that
+        can work. If nothing survives, the full list is kept so the
+        picker never comes up empty.
+        """
+        kept = []
+        for dev in devices:
+            working = []
+            for index, rate in dev.get("alts") or []:
+                probed = self.probe(index, rate)
+                if probed is None:
+                    continue
+                _, actual = probed
+                working.append((index, actual))
+            if working:
+                dev["alts"] = working
+                dev["index"], dev["rate"] = working[0]
+                kept.append(dev)
+        return kept or devices
 
     def _loaded(self, devices):
         self.devices = devices
