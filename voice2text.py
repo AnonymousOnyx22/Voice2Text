@@ -1,4 +1,26 @@
-import audioop
+try:
+    import audioop
+except ImportError:  # Python 3.13+ removed stdlib audioop
+    try:
+        import audioop_lts as audioop  # pip install audioop-lts
+    except ImportError:
+        import struct as _struct
+
+        class _AudioOpFallback:
+            @staticmethod
+            def rms(data, width):
+                if not data or width != 2:
+                    return 0
+                n = len(data) // 2
+                if n == 0:
+                    return 0
+                vals = _struct.unpack("<%dh" % n, data[: n * 2])
+                total = 0
+                for v in vals:
+                    total += v * v
+                return int((total / n) ** 0.5)
+
+        audioop = _AudioOpFallback()
 import ctypes
 from ctypes import wintypes
 import json
@@ -69,22 +91,44 @@ def input_devices():
     happen while drawing or while switching microphones.
     """
     import pyaudio
-    pa = pyaudio.PyAudio()
+    pa = None
+    try:
+        pa = pyaudio.PyAudio()
+    except Exception:
+        return []
     try:
         found = []
-        for i in range(pa.get_device_count()):
-            info = pa.get_device_info_by_index(i)
-            if info["maxInputChannels"] < 1:
+        try:
+            count = pa.get_device_count()
+        except Exception:
+            count = 0
+        for i in range(count):
+            try:
+                info = pa.get_device_info_by_index(i)
+            except Exception:
                 continue
-            name = info["name"]
-            virtual = any(v in name.lower() for v in VIRTUAL)
+            try:
+                if info.get("maxInputChannels", 0) < 1:
+                    continue
+                name = info.get("name", f"Mic {i}")
+                rate = int(info.get("defaultSampleRate", 44100) or 44100)
+            except Exception:
+                continue
+            virtual = any(v in str(name).lower() for v in VIRTUAL)
             found.append({"index": i, "name": name,
-                          "rate": int(info["defaultSampleRate"]),
+                          "rate": rate,
                           "virtual": virtual})
     finally:
-        pa.terminate()
+        if pa is not None:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
     found.sort(key=lambda d: d["virtual"])
-    return dedupe(found)
+    try:
+        return dedupe(found)
+    except Exception:
+        return found
 
 
 def dedupe(devices):
@@ -229,6 +273,7 @@ class Recorder:
         self.listening = False
         self.picking = False
         self.transcript = ""
+        self.is_error = False
         self.note = ""
         self.level = 0
         self.worker = None
@@ -243,11 +288,16 @@ class Recorder:
         self.seq = 0
         self.next_seq = 0
         self.pending = 0
+        self.session = 0  # bumps every recording; stale threads must ignore
         self.lock = threading.Lock()
         self.ui = queue.Queue()
         self.body_font = None
         self.foot_font = None
         self.trying = ""
+        # Pick the mic right now: plain enumeration is instant (no audio
+        # I/O), so there is no loading state. Endpoint probing happens
+        # at record time, when it is actually needed.
+        self.pick_initial_mic()
 
         self.canvas = tk.Canvas(root, width=W, height=self.height(),
                                 highlightthickness=0, bd=0, bg=KEY)
@@ -256,11 +306,18 @@ class Recorder:
         self.draw()
         self.center()
         self.root.update_idletasks()
-        self.hwnd = ctypes.windll.user32.GetAncestor(int(root.winfo_id()), 2)
-        make_non_activating(self.hwnd)
+        try:
+            self.hwnd = ctypes.windll.user32.GetAncestor(
+                int(root.winfo_id()), 2)
+            make_non_activating(self.hwnd)
+        except Exception:
+            self.hwnd = None
         self.register_hotkey()
-        self.root.after(30, self.load_devices)
         self.root.after(400, self.watch_focus)
+        # One perpetual UI loop from the start. It drains the queue from
+        # worker threads, so late transcriptions can never get stranded,
+        # and a single bad callback can never kill future updates.
+        self.root.after(UI_TICK, self.tick)
 
         root.bind("<Escape>", self.escape)
         root.bind("<space>", lambda e: self.toggle())
@@ -276,7 +333,13 @@ class Recorder:
 
     # -- geometry --------------------------------------------------------
     def height(self):
-        middle = len(self.devices) * H_ROW if self.picking else H_BODY
+        if self.picking:
+            # Always room for at least one row so the empty message
+            # is visible instead of a zero-height middle.
+            rows = min(max(len(self.devices), 1), 12)
+            middle = rows * H_ROW
+        else:
+            middle = H_BODY
         return H_HEAD + middle + H_FOOT
 
     def center(self):
@@ -316,9 +379,31 @@ class Recorder:
 
     def draw_devices(self):
         c = self.canvas
-        for row, dev in enumerate(self.devices):
+        if not self.devices:
+            tid = c.create_text(PAD, H_HEAD + H_ROW / 2, anchor="w",
+                                text="   No mic found - click here to rescan",
+                                fill=MUTED, font=(FONT, 9))
+            try:
+                x1, y1, x2, y2 = c.bbox(tid)
+                self.hits.append(("rescan", x1 - 4, y1 - 3, x2 + 4, y2 + 3))
+            except Exception:
+                pass
+            return
+        cur = self.current()
+        cur_name = cur["name"] if cur else None
+        # Window the list so the panel never grows off-screen; keep the
+        # current mic visible. Up/Down still cycles the full list.
+        visible = self.devices[:12]
+        if cur and cur not in visible:
+            try:
+                idx = self.devices.index(cur)
+            except ValueError:
+                idx = 0
+            start = max(0, min(idx - 6, len(self.devices) - 12))
+            visible = self.devices[start:start + 12]
+        for row, dev in enumerate(visible):
             y = H_HEAD + row * H_ROW
-            active = dev["index"] == self.device
+            active = cur_name is not None and dev["name"] == cur_name
             key = ("dev", dev["index"])
             if self.hover == key or active:
                 round_rect(c, 6, y + 2, W - 6, y + H_ROW - 2, 6,
@@ -447,6 +532,8 @@ class Recorder:
             if self.level >= 60 or self.trying:
                 return "Recording."
             return "Recording.  no input - press tab to switch mic"
+        if self.device is None or not self.devices:
+            return "No mic found - click mic"
         return f"{self.hotkey or 'Click'} To Record"
 
     def body(self):
@@ -460,56 +547,59 @@ class Recorder:
         self.draw()
 
     # -- devices ---------------------------------------------------------
-    def load_devices(self):
-        threading.Thread(target=self._load, daemon=True).start()
+    def pick_initial_mic(self):
+        """Select the mic instantly at startup. No probing, no waiting."""
+        try:
+            self.devices = input_devices()
+        except Exception:
+            self.devices = []
+        self.apply_saved_or_first()
 
-    def _load(self):
-        devices = input_devices()
-        devices = self.filter_working(devices)
-        self.post(self._loaded, devices)
-        self.root.after(0, self.tick)
-
-    def filter_working(self, devices):
-        """Keep only microphones that actually open.
-
-        Runs once at startup on the loader thread: endpoints that refuse
-        every sample rate or flood are dropped, and devices left with
-        nothing usable are hidden, so the picker lists only mics that
-        can work. If nothing survives, the full list is kept so the
-        picker never comes up empty.
-        """
-        kept = []
-        for dev in devices:
-            working = []
-            for index, rate in dev.get("alts") or []:
-                probed = self.probe(index, rate)
-                if probed is None:
-                    continue
-                _, actual = probed
-                working.append((index, actual))
-            if working:
-                dev["alts"] = working
-                dev["index"], dev["rate"] = working[0]
-                kept.append(dev)
-        return kept or devices
-
-    def _loaded(self, devices):
-        self.devices = devices
-        saved, endpoint = load_device()
-        pick = next((d for d in devices if d["name"] == saved), None)
+    def apply_saved_or_first(self):
+        """Saved mic if still plugged in, else first physical mic."""
+        if not self.devices:
+            self.device = None
+            return
+        try:
+            saved, endpoint = load_device()
+        except Exception:
+            saved, endpoint = None, None
+        pick = next((d for d in self.devices if d["name"] == saved), None)
         if pick is None:
-            pick = devices[0] if devices else None
-        if pick:
-            self.device, self.rate = pick["index"], pick["rate"]
-            # Prefer the endpoint that actually worked last time.
-            for index, rate in pick.get("alts") or []:
-                if index == endpoint:
-                    self.device, self.rate = index, rate
-                    break
+            real = [d for d in self.devices if not d.get("virtual")]
+            pick = real[0] if real else self.devices[0]
+        self.device, self.rate = pick["index"], pick["rate"]
+        for index, rate in pick.get("alts") or []:
+            if index == endpoint:
+                self.device, self.rate = index, rate
+                break
+
+    def rescan(self):
+        """Re-list microphones instantly (plug/unplug). No probing."""
+        if self.listening:
+            return
+        try:
+            self.devices = input_devices()
+        except Exception:
+            self.devices = []
+        if not self.devices:
+            self.device = None
+            self.picking = True
+            self.note = "no mic found"
+            self.refresh()
+            return
+        # Keep the current selection if still present, else saved/first.
+        if self.current() is None:
+            self.apply_saved_or_first()
+        self.picking = True
+        self.note = ""
         self.refresh()
 
     def toggle_picker(self):
         if self.listening:
+            return
+        if not self.devices:
+            self.rescan()
             return
         self.picking = not self.picking
         self.refresh()
@@ -517,9 +607,19 @@ class Recorder:
     def choose(self, index, close=True):
         """Switching is only a number change - no probing, so no stalling."""
         dev = next((d for d in self.devices if d["index"] == index), None)
+        if dev is None:
+            # self.device may currently be an alt endpoint; still allow
+            # picking by matching any alt.
+            for d in self.devices:
+                alts = [i for i, _ in (d.get("alts") or [])]
+                if index in alts:
+                    dev = d
+                    break
         if not dev:
             return
         self.device, self.rate = dev["index"], dev["rate"]
+        self.is_error = False
+        self.note = ""
         save_device(dev["name"], dev["index"])
         if close:
             self.picking = False
@@ -527,19 +627,32 @@ class Recorder:
 
     def step(self, delta):
         if not self.devices:
+            self.rescan()
+            return
+        if self.listening:
             return
         self.picking = True
         order = [d["index"] for d in self.devices]
-        i = order.index(self.device) if self.device in order else 0
+        cur = self.current()
+        cur_index = cur["index"] if cur else self.device
+        i = order.index(cur_index) if cur_index in order else 0
         self.choose(order[(i + delta) % len(order)], close=False)
 
     # -- window ----------------------------------------------------------
     def shutdown(self):
         try:
+            self.session += 1  # orphan any live worker/transcribe threads
+            self.listening = False
+        except Exception:
+            pass
+        try:
             ctypes.windll.user32.UnregisterHotKey(None, HOTKEY_ID)
         except Exception:
             pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def escape(self, _=None):
         if self.picking:
@@ -582,7 +695,12 @@ class Recorder:
         elif key == "copy":
             self.copy()
         elif key == "mic":
-            self.toggle_picker()
+            if not self.devices:
+                self.rescan()
+            else:
+                self.toggle_picker()
+        elif key == "rescan":
+            self.rescan()
 
     def motion(self, e):
         close = self.on_close(e.x, e.y)
@@ -599,36 +717,70 @@ class Recorder:
     def register_hotkey(self):
         """ctrl+alt+space records from anywhere, since clicking the panel no
         longer focuses it and plain key bindings would not reach us."""
-        user32 = ctypes.windll.user32
-        for mods, vk, label in HOTKEYS:
-            if user32.RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk):
-                self.hotkey = label
-                self.root.after(60, self.pump)
-                return
+        try:
+            user32 = ctypes.windll.user32
+            for mods, vk, label in HOTKEYS:
+                try:
+                    if user32.RegisterHotKey(None, HOTKEY_ID,
+                                             mods | MOD_NOREPEAT, vk):
+                        self.hotkey = label
+                        self.root.after(60, self.pump)
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            pass
         self.hotkey = ""
 
     def pump(self):
         """Drain hotkey messages; Tk has no idea about RegisterHotKey."""
-        user32 = ctypes.windll.user32
-        msg = wintypes.MSG()
-        while user32.PeekMessageW(ctypes.byref(msg), None,
-                                  WM_HOTKEY, WM_HOTKEY, 1):
-            if msg.wParam == HOTKEY_ID:
-                self.toggle()
-        self.root.after(60, self.pump)
+        try:
+            user32 = ctypes.windll.user32
+            msg = wintypes.MSG()
+            while user32.PeekMessageW(ctypes.byref(msg), None,
+                                      WM_HOTKEY, WM_HOTKEY, 1):
+                if msg.wParam == HOTKEY_ID:
+                    try:
+                        self.toggle()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
+            try:
+                self.root.after(60, self.pump)
+            except Exception:
+                pass
 
     def watch_focus(self):
         """Remember the last window that was not ours, to paste back into."""
         try:
             user32 = ctypes.windll.user32
             hwnd = user32.GetForegroundWindow()
-            mine = int(self.root.winfo_id())
-            root_of_mine = user32.GetAncestor(mine, 2)   # GA_ROOT
-            if hwnd and hwnd not in (mine, root_of_mine):
-                self.target = hwnd
+            try:
+                mine = int(self.root.winfo_id())
+            except Exception:
+                mine = None
+            try:
+                root_of_mine = user32.GetAncestor(mine, 2) if mine else None
+            except Exception:
+                root_of_mine = None
+            if hwnd and hwnd not in (mine, root_of_mine, self.hwnd):
+                # Only remember usable windows; closed ones would make
+                # paste silently do nothing later.
+                if user32.IsWindow(hwnd):
+                    self.target = hwnd
+                # Drop a dead target so insert() reports it instead of
+                # trying to focus a ghost window.
+                elif self.target and not user32.IsWindow(self.target):
+                    self.target = None
         except Exception:
             pass
-        self.root.after(400, self.watch_focus)
+        finally:
+            try:
+                self.root.after(400, self.watch_focus)
+            except Exception:
+                pass
 
     # -- recording -------------------------------------------------------
     def toggle(self):
@@ -637,51 +789,76 @@ class Recorder:
             self.note = "finishing"
             self.refresh()
             return
-        if self.device is None:
+        if self.device is None or not self.devices:
+            self.note = "no mic"
+            self.refresh()
+            self.rescan()
             return
         if self.worker and self.worker.is_alive():
+            # Previous take is still unwinding (closing the stream,
+            # posting 'stopped'). Starting now would orphan that thread
+            # and its 'stopped' would instantly kill the new take.
+            self.note = "finishing"
+            self.refresh()
             return
+        self.session += 1
+        sess = self.session
         self.picking = False
         self.listening = True
         self.transcript = ""
+        self.is_error = False
         self.words = []
         self.done = {}
         self.seq = self.next_seq = self.pending = 0
         self.note = ""
+        self.level = 0
+        self.trying = ""
         self.refresh()
-        self.worker = threading.Thread(target=self.record, daemon=True)
+        self.worker = threading.Thread(target=self.record, args=(sess,),
+                                       daemon=True)
         self.worker.start()
-        self.root.after(UI_TICK, self.tick)
+        # tick is perpetual; no need to (re)start it here.
 
-    def record(self):
+    def record(self, sess):
         """Record, moving to the next endpoint if this one hears nothing.
 
         A microphone is exposed several times by Windows and typically only
         one of those endpoints carries audio, so a silent one is not an error
         to report - it is a cue to try the next.
         """
-        endpoints = self.endpoints()
+        endpoints = self.endpoints(sess)
+        if not endpoints:
+            self.post(self.fail,
+                      "This microphone could not be opened. Press tab to "
+                      "choose a different microphone.", sess)
+            self.post(self.stopped, sess)
+            return
         for position, (index, rate) in enumerate(endpoints):
+            if sess != self.session or not self.listening:
+                break
             last = position == len(endpoints) - 1
             self.post(self.set_trying,
-                      "" if last else f"{position + 1}/{len(endpoints)}")
-            if self.capture(index, rate, allow_switch=not last):
-                self.remember_endpoint(index, self.rate)
+                      "" if last else f"{position + 1}/{len(endpoints)}",
+                      sess)
+            if self.capture(index, rate, allow_switch=not last, sess=sess):
+                if sess == self.session:
+                    self.remember_endpoint(index, self.rate)
                 break
-            if not self.listening:
+            if sess != self.session or not self.listening:
                 break
-            self.post(self.switching)
+            self.post(self.switching, sess)
         else:
-            if not self.words:
+            if sess == self.session and not self.words:
                 dev = self.current()
                 name = dev["name"] if dev else "this microphone"
                 self.post(self.fail,
                           f"No input from {name} on any of its "
                           f"{len(endpoints)} endpoints. Press tab to "
-                          f"choose a different microphone.")
-        self.post(self.stopped)
+                          f"choose a different microphone.", sess)
+        if sess == self.session:
+            self.post(self.stopped, sess)
 
-    def endpoints(self):
+    def endpoints(self, sess=None):
         """The chosen microphone's endpoints, loudest first.
 
         Only one endpoint of a device usually carries audio, so each is
@@ -694,7 +871,16 @@ class Recorder:
         alts = list(dev.get("alts") or [(dev["index"], dev["rate"])])
         ranked = []
         for index, rate in alts:
-            probed = self.probe(index, rate)
+            if sess is not None and sess != self.session:
+                return []
+            if not self.listening:
+                # Stopped while probing: abort early instead of opening
+                # more endpoints that would delay the stop.
+                break
+            try:
+                probed = self.probe(index, rate)
+            except Exception:
+                probed = None
             if probed is None:
                 continue                       # will not open, or floods
             level, rate = probed
@@ -720,7 +906,10 @@ class Recorder:
     def try_probe(self, index, rate):
         """Peak level over a short sample, or None if the endpoint is broken."""
         import pyaudio
-        pa = pyaudio.PyAudio()
+        try:
+            pa = pyaudio.PyAudio()
+        except Exception:
+            return None
         stream = None
         try:
             stream = pa.open(format=pyaudio.paInt16, channels=1, rate=rate,
@@ -728,8 +917,14 @@ class Recorder:
                              frames_per_buffer=1024)
             peak, reads, started = 0, 0, time.time()
             while time.time() - started < PROBE:
-                peak = max(peak, audioop.rms(
-                    stream.read(1024, exception_on_overflow=False), 2))
+                try:
+                    chunk = stream.read(1024, exception_on_overflow=False)
+                except Exception:
+                    return None
+                try:
+                    peak = max(peak, audioop.rms(chunk, 2))
+                except Exception:
+                    return None
                 reads += 1
                 if reads > (time.time() - started + 0.5) * rate / 1024 * 4:
                     return None                # floods instead of pacing
@@ -743,9 +938,14 @@ class Recorder:
                     stream.close()
                 except Exception:
                     pass
-            pa.terminate()
+            try:
+                pa.terminate()
+            except Exception:
+                pass
 
-    def set_trying(self, label):
+    def set_trying(self, label, sess=None):
+        if sess is not None and sess != self.session:
+            return
         self.trying = label
 
     def remember_endpoint(self, index, rate):
@@ -754,7 +954,9 @@ class Recorder:
         if dev:
             save_device(dev["name"], index)
 
-    def switching(self):
+    def switching(self, sess=None):
+        if sess is not None and sess != self.session:
+            return
         self.note = "trying next endpoint"
         self.refresh()
 
@@ -766,7 +968,7 @@ class Recorder:
         -9999; a sibling rate usually opens fine. Returns the stream and
         the rate that worked. Non--9999 errors are raised immediately.
         """
-        last = None
+        last = OSError("could not open microphone")
         for attempt in dict.fromkeys([rate, 48000, 44100, 16000]):
             try:
                 return pa.open(format=pyaudio.paInt16, channels=1,
@@ -777,25 +979,53 @@ class Recorder:
                 last = e
                 if "-9999" not in str(e):
                     raise
+            except Exception:
+                raise
         raise last
 
-    def capture(self, index, rate, allow_switch):
+    def capture(self, index, rate, allow_switch, sess=None):
         """Stream one endpoint. False means it never heard anything."""
         import pyaudio
-        pa = pyaudio.PyAudio()
+        pa = None
+        try:
+            pa = pyaudio.PyAudio()
+        except Exception as e:
+            if sess is not None and sess != self.session:
+                return True
+            if allow_switch:
+                return False
+            self.post(self.fail, f"{type(e).__name__}: {e}",
+                      sess if sess is not None else self.session)
+            return True
         stream = None
         heard = False
         try:
             stream, rate = self.open_stream(pa, pyaudio, index, rate)
+            if sess is not None and sess != self.session:
+                return True
             self.rate = rate
             chunk = 1024 / rate
-            floor = self.measure_floor(stream, rate)
+            floor = self.measure_floor(stream, rate, sess=sess)
+            if sess is not None and sess != self.session:
+                return True
+            if not self.listening:
+                return True
             speech = min(MAX_SPEECH, max(MIN_SPEECH, floor * 3))
 
             segment, quiet, voiced = [], 0.0, False
             started = time.time()
             while self.listening:
-                data = stream.read(1024, exception_on_overflow=False)
+                if sess is not None and sess != self.session:
+                    return True
+                try:
+                    data = stream.read(1024, exception_on_overflow=False)
+                except Exception as e:
+                    # Stream died mid-take (unplugged/sleep). Let the
+                    # endpoint logic move on instead of hanging.
+                    if "Input overflowed" in str(type(e).__name__) or \
+                            "overflow" in str(e).lower():
+                        continue
+                    raise
                 level = audioop.rms(data, 2)
                 self.level = level
                 segment.append(data)
@@ -814,12 +1044,10 @@ class Recorder:
 
                 long_enough = len(segment) * chunk > PHRASE_MAX
                 if voiced and (quiet > PHRASE_GAP or long_enough):
-                    self.dispatch(b"".join(segment), rate)
+                    self.dispatch(b"".join(segment), rate, sess)
                     segment, quiet, voiced = [], 0.0, False
                 elif not voiced and len(segment) * chunk > 1.5:
                     segment = segment[-int(0.3 / chunk):]   # drop dead air
-
-                pass
 
                 elapsed = time.time() - started
                 if elapsed > MAX_SECONDS:
@@ -830,18 +1058,23 @@ class Recorder:
                 if len(segment) > (elapsed + 1) * rate / 1024 * 3:
                     if allow_switch:
                         return False
-                    self.post(self.fail, BAD_DEVICE)
+                    self.post(self.fail, BAD_DEVICE,
+                              sess if sess is not None else self.session)
                     return True
-            if voiced:
-                self.dispatch(b"".join(segment), rate)
+            if voiced and (sess is None or sess == self.session):
+                self.dispatch(b"".join(segment), rate, sess)
             return True
         except Exception as e:
+            if sess is not None and sess != self.session:
+                return True
             if allow_switch:
                 return False
             if isinstance(e, OSError) and "-9999" in str(e):
-                self.post(self.fail, MIC_BLOCKED)
+                self.post(self.fail, MIC_BLOCKED,
+                          sess if sess is not None else self.session)
             else:
-                self.post(self.fail, f"{type(e).__name__}: {e}")
+                self.post(self.fail, f"{type(e).__name__}: {e}",
+                          sess if sess is not None else self.session)
             return True
         finally:
             if stream is not None:
@@ -850,9 +1083,13 @@ class Recorder:
                     stream.close()
                 except Exception:
                     pass
-            pa.terminate()
+            if pa is not None:
+                try:
+                    pa.terminate()
+                except Exception:
+                    pass
 
-    def measure_floor(self, stream, rate, seconds=0.3):
+    def measure_floor(self, stream, rate, seconds=0.3, sess=None):
         """Room noise, so the speech threshold suits the actual microphone.
 
         The quietest chunk is used, not the average: recording often starts
@@ -861,20 +1098,30 @@ class Recorder:
         """
         levels = []
         for _ in range(max(1, int(rate / 1024 * seconds))):
-            levels.append(audioop.rms(
-                stream.read(1024, exception_on_overflow=False), 2))
-        return min(levels)
+            if sess is not None and sess != self.session:
+                break
+            if not self.listening:
+                break
+            try:
+                levels.append(audioop.rms(
+                    stream.read(1024, exception_on_overflow=False), 2))
+            except Exception:
+                break
+            self.level = levels[-1] if levels else 0
+        return min(levels) if levels else 150
 
-    def dispatch(self, raw, rate):
+    def dispatch(self, raw, rate, sess=None):
         """Transcribe one phrase without blocking capture."""
+        if sess is None:
+            sess = self.session
         with self.lock:
             self.pending += 1
             seq = self.seq
             self.seq += 1
-        threading.Thread(target=self.transcribe, args=(raw, rate, seq),
+        threading.Thread(target=self.transcribe, args=(raw, rate, seq, sess),
                          daemon=True).start()
 
-    def transcribe(self, raw, rate, seq):
+    def transcribe(self, raw, rate, seq, sess):
         text = ""
         try:
             text = self.recognizer.recognize_google(
@@ -882,13 +1129,19 @@ class Recorder:
         except sr.UnknownValueError:
             pass
         except sr.RequestError as e:
-            self.post(self.fail, f"Network unavailable: {e}")
+            # Only the live take reports network trouble; a stale thread
+            # from a previous take must never kill the new recording.
+            if sess == self.session:
+                self.post(self.fail, f"Network unavailable: {e}", sess)
         except Exception as e:
-            self.post(self.fail, f"{type(e).__name__}: {e}")
-        self.post(self.add_words, text, seq)
+            if sess == self.session:
+                self.post(self.fail, f"{type(e).__name__}: {e}", sess)
+        self.post(self.add_words, text, seq, sess)
 
-    def add_words(self, text, seq):
+    def add_words(self, text, seq, sess=None):
         """Phrases can come back out of order, so hold them until their turn."""
+        if sess is not None and sess != self.session:
+            return
         self.done[seq] = text
         while self.next_seq in self.done:
             part = self.done.pop(self.next_seq)
@@ -896,24 +1149,44 @@ class Recorder:
             if part:
                 self.words.extend(part.split())
         with self.lock:
-            self.pending -= 1
-        self.transcript = " ".join(self.words)
+            self.pending = max(0, self.pending - 1)
+        if self.words:
+            self.is_error = False
+            self.transcript = " ".join(self.words)
+        elif not self.is_error:
+            # Empty phrase (silence / unintelligible): keep whatever real
+            # words we already have, don't wipe the transcript.
+            if not self.transcript:
+                self.transcript = ""
         self.refresh()
 
-    def stopped(self):
+    def stopped(self, sess=None):
+        if sess is not None and sess != self.session:
+            return
         self.listening = False
         self.trying = ""
         self.level = 0
-        if self.transcript:
-            self.to_clipboard(self.transcript)
-            self.note = "copied"
+        if self.transcript and not self.is_error:
+            if self.to_clipboard(self.transcript):
+                self.note = "copied"
+            else:
+                self.note = "copy failed - press copy"
+        elif self.is_error and not self.transcript:
+            self.note = ""
         self.refresh()
 
-    def fail(self, message):
+    def fail(self, message, sess=None):
+        if sess is not None and sess != self.session:
+            return
         self.listening = False
+        self.trying = ""
         self.level = 0
         self.words = []
+        with self.lock:
+            self.pending = 0
+        self.done = {}
         self.transcript = message
+        self.is_error = True
         self.refresh()
 
     def post(self, fn, *args):
@@ -923,57 +1196,95 @@ class Recorder:
         and transcription threads queue their updates instead of calling into
         the widget directly.
         """
-        self.ui.put((fn, args))
+        try:
+            self.ui.put((fn, args))
+        except Exception:
+            pass
 
     def tick(self):
-        """Drain queued updates and repaint at a fixed, sane rate."""
-        dirty = False
-        while True:
-            try:
-                fn, args = self.ui.get_nowait()
-            except queue.Empty:
-                break
-            fn(*args)
-            dirty = True
-        if dirty or self.listening:
-            self.refresh()
-        if self.listening or not self.ui.empty():
-            self.root.after(UI_TICK, self.tick)
+        """Drain queued updates and repaint at a fixed, sane rate.
 
-    def finish(self, text, ok):
-        self.listening = False
-        self.level = 0
-        self.transcript = text
-        self.note = ""
-        if ok and text:
-            self.to_clipboard(text)
-            self.note = "copied"
-        self.refresh()
+        Perpetual: always reschedules, so late transcriptions posted after
+        a quiet period are still processed. One bad callback can never
+        kill the loop.
+        """
+        try:
+            dirty = False
+            while True:
+                try:
+                    fn, args = self.ui.get_nowait()
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+                try:
+                    fn(*args)
+                except Exception:
+                    pass
+                dirty = True
+            try:
+                if dirty or self.listening:
+                    self.refresh()
+            except Exception:
+                pass
+        finally:
+            try:
+                self.root.after(UI_TICK, self.tick)
+            except Exception:
+                pass
 
     # -- output ----------------------------------------------------------
     def copy(self):
-        if self.transcript:
-            self.to_clipboard(self.transcript)
+        if not self.transcript or self.is_error:
+            return
+        if self.to_clipboard(self.transcript):
             self.note = "copied"
-            self.refresh()
+        else:
+            self.note = "copy failed"
+        self.refresh()
 
     def insert(self):
         """Paste the transcript into whatever box last had focus."""
-        if not self.transcript:
+        if not self.transcript or self.is_error:
             return
-        if not self.target:
+        try:
+            import ctypes as _ct
+            alive = _ct.windll.user32.IsWindow(self.target) if self.target \
+                else False
+        except Exception:
+            alive = bool(self.target)
+        if not self.target or not alive:
             self.note = "no target window"
             self.refresh()
             return
-        self.to_clipboard(self.transcript)
+        if not self.to_clipboard(self.transcript):
+            self.note = "copy failed"
+            self.refresh()
+            return
         self.note = "inserted"
         self.refresh()
-        self.root.after(10, lambda: send_paste(self.target))
+        try:
+            target = self.target
+            self.root.after(10, lambda t=target: send_paste(t))
+        except Exception:
+            pass
 
     def to_clipboard(self, text):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.root.update()
+        """Copy text; never let a clipboard error kill the UI loop."""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            # update() flushes the clipboard claim, but it also pumps all
+            # pending Tk events (re-entrancy). update_idletasks is enough
+            # to keep geometry correct; the clipboard is claimed on
+            # Windows without a full update().
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
 
 def already_running():
